@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"math/rand/v2"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,14 +28,27 @@ const (
 	roomCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // no 0/O/1/I
 	waitGrace        = 30 * time.Second                   // queue/room survive a short disconnect
 	idleClientTTL    = 3 * time.Minute                    // a forgotten menu player just gets a fresh Client on reconnect
+
+	minQuestionSecs = 3   // the shortest time to answer a question anybody may ask for
+	maxQuestionSecs = 120 // ...and the longest one a game may choose
+	maxRounds       = 12
+	maxQPerRound    = 10
 )
 
 var (
-	errUnknown = errors.New("игрок не найден, обновите страницу")
-	errBusy    = errors.New("сначала завершите текущую игру")
-	errNoRoom  = errors.New("комната не найдена или уже закрыта")
-	errOwnRoom = errors.New("это ваша собственная комната")
-	errNoGame  = errors.New("вы сейчас не в игре")
+	errUnknown    = errors.New("игрок не найден, обновите страницу")
+	errBusy       = errors.New("сначала завершите текущую игру")
+	errNoRoom     = errors.New("комната не найдена или уже закрыта")
+	errNoGame     = errors.New("вы сейчас не в игре")
+	errBadTime    = errors.New("время на ответ должно быть от 3 до 120 секунд")
+	errBadSize    = errors.New("в матче должно быть от 1 до 12 раундов и от 1 до 10 вопросов в раунде")
+	errBadCats    = errors.New("выберите минимум две темы, в которых хватает вопросов")
+	errBadBot     = errors.New("неизвестная сложность бота")
+	errBadBots    = errors.New("ботов может быть от 0 до 7, а игроков вместе с ними — не больше 8")
+	errRoomFull   = errors.New("в комнате нет свободных мест")
+	errNotHost    = errors.New("начать игру может только создатель комнаты")
+	errFewPlayers = errors.New("для игры нужны минимум два участника: добавьте друга или ботов")
+	errBadHint    = errors.New("неизвестная подсказка")
 )
 
 // sub is one open SSE connection.
@@ -68,6 +83,8 @@ func (s *sub) replace() { s.once.Do(func() { close(s.quit) }) }
 // Client is a browser identified by the id it keeps in sessionStorage.
 type Client struct {
 	id string
+
+	user string // the profile this browser plays for, "" if none (guarded by Hub.mu)
 
 	// guarded by Hub.mu
 	name     string
@@ -106,19 +123,28 @@ func (c *Client) connected() bool {
 // and, from their own goroutine, Hub.mu inside the hooks; the hub never
 // blocks on a match, so there is no cycle.
 type Hub struct {
-	cfg  Config
-	bank *Bank
+	cfg   Config
+	bank  *Bank
+	store *Store // nil: no profiles and no statistics
 
 	maxClients int // 0: no limit
 
 	mu      sync.Mutex
 	clients map[string]*Client
-	queue   string            // id of the player waiting for a random opponent
-	rooms   map[string]string // room code -> owner id
+	queue   string           // id of the player waiting for a random opponent
+	rooms   map[string]*room // by code
+}
+
+// room is a private room before its game starts: the creator and the friends
+// who joined, in the order they came.
+type room struct {
+	code    string
+	members []*Client // the creator first
+	rules   ruleset
 }
 
 func NewHub(cfg Config, bank *Bank) *Hub {
-	return &Hub{cfg: cfg, bank: bank, clients: map[string]*Client{}, rooms: map[string]string{}}
+	return &Hub{cfg: cfg, bank: bank, clients: map[string]*Client{}, rooms: map[string]*room{}}
 }
 
 // canAccept reports whether the player may open a connection: a known one
@@ -215,6 +241,9 @@ func (h *Hub) disconnect(c *Client, s *sub) {
 	c.connGen++
 	gen := c.connGen
 	m, seat, status := c.match, c.seat, c.status
+	if status == stRoom {
+		h.pushRoom(c.room) // the others see who is away
+	}
 	h.mu.Unlock()
 
 	switch status {
@@ -248,24 +277,73 @@ func (h *Hub) pushState(c *Client) {
 	case stQueue:
 		st.Screen = "queue"
 	case stRoom:
+		rm := h.rooms[c.room]
+		if rm == nil {
+			st.Screen = "menu"
+			break
+		}
 		st.Screen = "room"
-		st.Room = c.room
+		st.Room = rm.code
+		r := rulesView(rm.rules.cfg)
+		st.Rules = &r
+		if len(rm.rules.bank.Cats) < len(h.bank.Cats) {
+			for _, cat := range rm.rules.bank.Cats {
+				st.RoomCats = append(st.RoomCats, catView(cat))
+			}
+		}
+		st.Lobby = rm.lobbyFor(c)
 	default:
 		st.Screen = "menu"
 	}
 	c.push(st)
 }
 
-// stopWaiting drops c out of the queue or its private room. Caller holds h.mu.
+// pushRoom sends everybody in the room the list of who is there. Caller holds h.mu.
+func (h *Hub) pushRoom(code string) {
+	if rm := h.rooms[code]; rm != nil {
+		for _, m := range rm.members {
+			h.pushState(m)
+		}
+	}
+}
+
+func (rm *room) lobbyFor(c *Client) *LobbyView {
+	lv := &LobbyView{Host: rm.members[0] == c, Max: maxSeats}
+	here := 0
+	for i, m := range rm.members {
+		lv.Players = append(lv.Players, LobbyPlayer{Name: m.name, Owner: i == 0, Me: m == c, Connected: m.connected()})
+		if m.connected() {
+			here++
+		}
+	}
+	for range rm.rules.bots {
+		lv.Players = append(lv.Players, LobbyPlayer{Name: "🤖 Бот", Bot: true, Connected: true})
+	}
+	lv.CanStart = lv.Host && here+rm.rules.bots >= 2
+	return lv
+}
+
+// stopWaiting drops c out of the queue or its private room: the creator
+// closes the room, a guest just leaves it. Caller holds h.mu.
 func (h *Hub) stopWaiting(c *Client) {
 	if h.queue == c.id {
 		h.queue = ""
 	}
-	if c.room != "" {
-		delete(h.rooms, c.room)
-		c.room = ""
-	}
+	rm := h.rooms[c.room]
+	c.room = ""
 	c.status = stMenu
+	if rm != nil {
+		if rm.members[0] == c {
+			delete(h.rooms, rm.code)
+			for _, m := range rm.members[1:] {
+				m.room, m.status = "", stMenu
+				h.pushState(m)
+			}
+		} else {
+			rm.members = slices.DeleteFunc(rm.members, func(m *Client) bool { return m == c })
+			h.pushRoom(rm.code)
+		}
+	}
 	h.pushState(c)
 }
 
@@ -291,7 +369,33 @@ func (h *Hub) Rename(id, name string) error {
 		return errBusy
 	}
 	c.name = cleanName(name)
+	if c.user != "" {
+		h.store.SetName(c.user, c.name)
+	}
 	h.pushState(c)
+	return nil
+}
+
+// known reports whether the player has a connection with the server.
+func (h *Hub) known(id string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.clients[id] != nil
+}
+
+// Attach makes the browser play for the profile uid, whose name it takes.
+func (h *Hub) Attach(id, uid, name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c, err := h.get(id)
+	if err != nil {
+		return err
+	}
+	c.user = uid
+	if c.status != stMatch {
+		c.name = name
+		h.pushState(c)
+	}
 	return nil
 }
 
@@ -307,7 +411,7 @@ func (h *Hub) Quick(id string) error {
 	}
 	if w := h.clients[h.queue]; w != nil && w != c && w.status == stQueue && w.connected() {
 		h.queue = ""
-		h.startMatch(w, c)
+		h.startMatch([]*Client{w, c}, h.defaultRules())
 		return nil
 	}
 	h.queue = id
@@ -316,7 +420,8 @@ func (h *Hub) Quick(id string) error {
 	return nil
 }
 
-func (h *Hub) Bot(id string) error {
+// Bot starts a game against bots (one, unless the player asked for more).
+func (h *Hub) Bot(id string, o GameOpts) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	c, err := h.get(id)
@@ -326,11 +431,87 @@ func (h *Hub) Bot(id string) error {
 	if c.status != stMenu {
 		return errBusy
 	}
-	h.startMatch(c, nil)
+	rs, err := h.rules(o)
+	if err != nil {
+		return err
+	}
+	rs.bots = max(rs.bots, 1)
+	h.startMatch([]*Client{c}, rs)
 	return nil
 }
 
-func (h *Hub) CreateRoom(id string) error {
+// GameOpts are the rules the creator of a private room or of a game against a
+// bot chooses; the zero value means the server's defaults.
+type GameOpts struct {
+	Seconds   int      // time to answer one question
+	Rounds    int      // rounds in the match
+	QPerRound int      // questions in a round
+	Speed     bool     // a faster right answer is worth more
+	Tiebreak  bool     // level scores are settled by extra questions
+	Hints     bool     // every player may use each hint once
+	Bots      int      // bots that play too
+	Cats      []string // ids of the categories to play, none: all of them
+	Level     string   // bots: easy | normal | hard
+}
+
+// ruleset is everything that makes one match different from another.
+type ruleset struct {
+	cfg  Config
+	bank *Bank
+	bot  botLevel // how well the bots play
+	bots int      // how many of them
+}
+
+func (h *Hub) defaultRules() ruleset { return ruleset{cfg: h.cfg, bank: h.bank, bot: botNormal} }
+
+// rules checks what a player asked for and turns it into the rules of a match.
+func (h *Hub) rules(o GameOpts) (ruleset, error) {
+	rs := h.defaultRules()
+	if o.Seconds != 0 {
+		if o.Seconds < minQuestionSecs || o.Seconds > maxQuestionSecs {
+			return rs, errBadTime
+		}
+		rs.cfg.QuestionTime = time.Duration(o.Seconds) * time.Second
+	}
+	if o.Rounds != 0 {
+		rs.cfg.Rounds = o.Rounds
+	}
+	if o.QPerRound != 0 {
+		rs.cfg.QPerRound = o.QPerRound
+	}
+	if rs.cfg.Rounds < 1 || rs.cfg.Rounds > maxRounds || rs.cfg.QPerRound < 1 || rs.cfg.QPerRound > maxQPerRound {
+		return rs, errBadSize
+	}
+	if o.Bots < 0 || o.Bots > maxSeats-1 {
+		return rs, errBadBots
+	}
+	rs.bots = o.Bots
+	rs.cfg.SpeedScore = o.Speed
+	rs.cfg.Tiebreak = o.Tiebreak
+	rs.cfg.Hints = o.Hints
+	if len(o.Cats) > 0 {
+		bank, err := h.bank.Only(rs.cfg.QPerRound, o.Cats)
+		if err != nil {
+			return rs, err
+		}
+		rs.bank = bank
+	} else if rs.cfg.QPerRound != h.cfg.QPerRound {
+		rs.bank = h.bank.Without(rs.cfg.QPerRound) // categories too small for the longer round drop out
+	}
+	if len(rs.bank.Cats) < 2 {
+		return rs, errBadCats
+	}
+	if o.Level != "" {
+		l, ok := botLevels[o.Level]
+		if !ok {
+			return rs, errBadBot
+		}
+		rs.bot = l
+	}
+	return rs, nil
+}
+
+func (h *Hub) CreateRoom(id string, o GameOpts) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	c, err := h.get(id)
@@ -340,17 +521,23 @@ func (h *Hub) CreateRoom(id string) error {
 	if c.status != stMenu {
 		return errBusy
 	}
+	rs, err := h.rules(o)
+	if err != nil {
+		return err
+	}
+	rm := &room{members: []*Client{c}, rules: rs}
 	for {
 		code := make([]byte, roomCodeLen)
 		for i := range code {
 			code[i] = roomCodeAlphabet[rand.IntN(len(roomCodeAlphabet))]
 		}
 		if _, taken := h.rooms[string(code)]; !taken {
-			c.room = string(code)
+			rm.code = string(code)
 			break
 		}
 	}
-	h.rooms[c.room] = id
+	h.rooms[rm.code] = rm
+	c.room = rm.code
 	c.status = stRoom
 	h.pushState(c)
 	return nil
@@ -366,17 +553,50 @@ func (h *Hub) JoinRoom(id, code string) error {
 	if c.status != stMenu {
 		return errBusy
 	}
-	code = strings.ToUpper(strings.TrimSpace(code))
-	owner := h.clients[h.rooms[code]]
-	if owner == nil || owner.status != stRoom || owner.room != code || !owner.connected() {
+	rm := h.rooms[strings.ToUpper(strings.TrimSpace(code))]
+	if rm == nil || !rm.members[0].connected() {
 		return errNoRoom
 	}
-	if owner == c {
-		return errOwnRoom
+	if len(rm.members)+rm.rules.bots >= maxSeats {
+		return errRoomFull
 	}
-	delete(h.rooms, code)
-	owner.room = ""
-	h.startMatch(owner, c)
+	rm.members = append(rm.members, c)
+	c.room, c.status = rm.code, stRoom
+	h.pushRoom(rm.code)
+	return nil
+}
+
+// Start begins the game of the room: its creator presses the button once
+// everybody is here. Friends who dropped off in the meantime are left out.
+func (h *Hub) Start(id string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	c, err := h.get(id)
+	if err != nil {
+		return err
+	}
+	rm := h.rooms[c.room]
+	if c.status != stRoom || rm == nil || rm.members[0] != c {
+		return errNotHost
+	}
+	var here []*Client
+	for _, m := range rm.members {
+		if m.connected() {
+			here = append(here, m)
+		}
+	}
+	if len(here)+rm.rules.bots < 2 {
+		return errFewPlayers
+	}
+	delete(h.rooms, rm.code)
+	for _, m := range rm.members {
+		m.room = ""
+		if !m.connected() {
+			m.status = stMenu
+			h.pushState(m)
+		}
+	}
+	h.startMatch(here, rm.rules)
 	return nil
 }
 
@@ -441,6 +661,30 @@ func (h *Hub) Pick(id string, index int) error {
 	return nil
 }
 
+// Pause freezes (on) or unfreezes the category wheel; the match ignores it in any other phase.
+func (h *Hub) Pause(id string, on bool) error {
+	m, seat, err := h.matchOf(id)
+	if err != nil {
+		return err
+	}
+	m.post(event{kind: evPause, seat: seat, flag: on})
+	return nil
+}
+
+// Hint spends one of the player's hints: "fifty", "second" or "extra".
+func (h *Hub) Hint(id, kind string) error {
+	n := slices.Index([]string{"fifty", "second", "extra"}, kind)
+	if n < 0 {
+		return errBadHint
+	}
+	m, seat, err := h.matchOf(id)
+	if err != nil {
+		return err
+	}
+	m.post(event{kind: evHint, seat: seat, n: n})
+	return nil
+}
+
 func (h *Hub) Answer(id string, seq, index int) error {
 	m, seat, err := h.matchOf(id)
 	if err != nil {
@@ -461,23 +705,56 @@ func (h *Hub) Rematch(id string) error {
 
 // ---- match lifecycle -----------------------------------------------------
 
-// startMatch pairs a with b, or with a bot when b is nil. Caller holds h.mu.
-func (h *Hub) startMatch(a, b *Client) {
-	seats := [2]*seat{h.humanSeat(a), nil}
-	if b != nil {
-		seats[1] = h.humanSeat(b)
-	} else {
-		seats[1] = newBotSeat()
+// startMatch seats the humans (and the bots the rules ask for) at one table.
+// Caller holds h.mu.
+func (h *Hub) startMatch(humans []*Client, rs ruleset) {
+	seats := make([]*seat, 0, len(humans)+rs.bots)
+	var taken []string
+	for _, c := range humans {
+		seats = append(seats, h.humanSeat(c))
+		taken = append(taken, c.name)
 	}
-	h.launch(seats, rand.IntN(2))
+	seats = append(seats, newBotSeats(rs.bots, rs.bot, taken)...)
+	labelDuplicates(seats)
+	unlinkSameUser(seats)
+	h.launch(seats, rand.IntN(len(seats)), rs)
+}
+
+// unlinkSameUser keeps a profile from playing against itself (two tabs of one
+// browser): such a match counts for nobody.
+func unlinkSameUser(seats []*seat) {
+	n := map[string]int{}
+	for _, s := range seats {
+		n[s.user]++
+	}
+	for _, s := range seats {
+		if s.user != "" && n[s.user] > 1 {
+			s.user = ""
+		}
+	}
+}
+
+// labelDuplicates tells apart players who have the same name.
+func labelDuplicates(seats []*seat) {
+	seen := map[string]int{}
+	for _, s := range seats {
+		seen[s.name]++
+		if n := seen[s.name]; n > 1 {
+			s.label = s.name + " " + strconv.Itoa(n)
+		}
+	}
 }
 
 func (h *Hub) humanSeat(c *Client) *seat {
-	return &seat{cl: c, name: c.name, connected: c.connected()}
+	return &seat{cl: c, user: c.user, name: c.name, connected: c.connected()}
 }
 
-func (h *Hub) launch(seats [2]*seat, firstPicker int) {
-	m := newMatch(h.cfg, h.bank, seats, firstPicker, matchHooks{rematch: h.rematchHook, ended: h.endedHook})
+func (h *Hub) launch(seats []*seat, firstPicker int, rs ruleset) {
+	hooks := matchHooks{rematch: h.rematchHook, ended: h.endedHook}
+	if h.store != nil {
+		hooks.answers, hooks.finished = h.store.RecordAnswers, h.store.RecordMatch
+	}
+	m := newMatch(rs.cfg, rs.bank, seats, firstPicker, hooks)
 	for i, s := range seats {
 		if c := s.cl; c != nil {
 			c.status, c.match, c.seat, c.room = stMatch, m, i, ""
@@ -486,19 +763,26 @@ func (h *Hub) launch(seats [2]*seat, firstPicker int) {
 	go m.run()
 }
 
-// rematchHook runs on the finished match's goroutine once both players want
-// to play again: same people, same bot, the other one picks first.
+// rematchHook runs on the finished match's goroutine once everybody who is
+// still there wants to play again: same people, same bots, same rules, the
+// next one picks first.
 func (h *Hub) rematchHook(old *Match) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	var seats [2]*seat
-	for i, s := range old.seats {
-		if s.cl != nil && s.cl.match != old {
-			return // that player already went elsewhere
+	var seats []*seat
+	for _, s := range old.seats {
+		if s.left || (s.cl != nil && s.cl.match != old) { // gone, or already somewhere else
+			continue
 		}
-		seats[i] = &seat{cl: s.cl, name: s.name, bot: s.bot, accuracy: s.accuracy, connected: s.bot || s.cl.connected()}
+		seats = append(seats, &seat{
+			cl: s.cl, user: s.user, name: s.name, label: s.label, bot: s.bot, accuracy: s.accuracy, delayLo: s.delayLo, delayHi: s.delayHi,
+			connected: s.bot || s.cl.connected(),
+		})
 	}
-	h.launch(seats, 1-old.firstPicker)
+	if len(seats) < 2 {
+		return
+	}
+	h.launch(seats, (old.firstPicker+1)%len(seats), ruleset{cfg: old.cfg, bank: old.bank})
 }
 
 // endedHook sends everybody still attached to a finished match back to the menu.

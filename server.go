@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -63,26 +64,50 @@ func (s *Server) guard(lim *limiter, next http.HandlerFunc) http.HandlerFunc {
 
 // request is the body of every POST; each endpoint reads the fields it needs.
 type request struct {
-	PID   string `json:"pid"`
-	Name  string `json:"name"`
-	Code  string `json:"code"`
-	Index int    `json:"index"`
-	Seq   int    `json:"seq"`
+	PID      string `json:"pid"`
+	Name     string `json:"name"`
+	Code     string `json:"code"`
+	Index    int    `json:"index"`
+	Seq      int    `json:"seq"`
+	On       bool   `json:"on"`
+	Seconds  int    `json:"seconds"`  // room, bot: time to answer a question
+	Speed    bool   `json:"speed"`    // room, bot: a faster right answer is worth more
+	Tiebreak bool   `json:"tiebreak"` // room, bot: level scores are settled by extra questions
+
+	Rounds    int      `json:"rounds"`    // room, bot
+	QPerRound int      `json:"qPerRound"` // room, bot
+	Cats      []string `json:"cats"`      // room, bot: categories to play, none: all
+	Level     string   `json:"level"`     // bot: easy | normal | hard
+	Hints     bool     `json:"hints"`     // room, bot: every player has three hints
+	Bots      int      `json:"bots"`      // room, bot: bots that play too
+	Kind      string   `json:"kind"`      // hint: fifty | second | extra
+	UID       string   `json:"uid"`       // login: the profile, "" to make a new one
+	Secret    string   `json:"secret"`    // login: its secret
+}
+
+func (r request) game() GameOpts {
+	return GameOpts{Seconds: r.Seconds, Rounds: r.Rounds, QPerRound: r.QPerRound, Speed: r.Speed, Tiebreak: r.Tiebreak, Hints: r.Hints, Bots: r.Bots, Cats: r.Cats, Level: r.Level}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/events", s.guard(s.connLim, s.events))
 	mux.HandleFunc("GET /api/info", s.guard(s.actionLim, s.info))
+	mux.HandleFunc("POST /api/login", s.guard(s.actionLim, s.login))
+	mux.HandleFunc("GET /api/profile", s.guard(s.actionLim, s.profile))
+	mux.HandleFunc("GET /api/top", s.guard(s.actionLim, s.top))
 
 	mux.HandleFunc("POST /api/name", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Rename(r.PID, r.Name) })))
 	mux.HandleFunc("POST /api/quick", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Quick(r.PID) })))
-	mux.HandleFunc("POST /api/bot", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Bot(r.PID) })))
-	mux.HandleFunc("POST /api/room", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.CreateRoom(r.PID) })))
+	mux.HandleFunc("POST /api/bot", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Bot(r.PID, r.game()) })))
+	mux.HandleFunc("POST /api/room", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.CreateRoom(r.PID, r.game()) })))
 	mux.HandleFunc("POST /api/join", s.guard(s.joinLim, s.guard(s.actionLim, s.action(func(r request) error { return s.hub.JoinRoom(r.PID, r.Code) }))))
+	mux.HandleFunc("POST /api/start", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Start(r.PID) })))
+	mux.HandleFunc("POST /api/hint", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Hint(r.PID, r.Kind) })))
 	mux.HandleFunc("POST /api/cancel", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Cancel(r.PID) })))
 	mux.HandleFunc("POST /api/leave", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Leave(r.PID) })))
 	mux.HandleFunc("POST /api/pick", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Pick(r.PID, r.Index) })))
+	mux.HandleFunc("POST /api/pause", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Pause(r.PID, r.On) })))
 	mux.HandleFunc("POST /api/answer", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Answer(r.PID, r.Seq, r.Index) })))
 	mux.HandleFunc("POST /api/rematch", s.guard(s.actionLim, s.action(func(r request) error { return s.hub.Rematch(r.PID) })))
 
@@ -107,7 +132,7 @@ func (s *Server) action(fn func(request) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req request
 		http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректный запрос"})
 			return
@@ -122,6 +147,91 @@ func (s *Server) action(fn func(request) error) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}
+}
+
+func fail(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// login links the browser to a profile: a new one when it has none yet, the
+// one its secret opens otherwise.
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	store := s.hub.store
+	if store == nil {
+		fail(w, http.StatusNotFound, "профили отключены")
+		return
+	}
+	var req request
+	http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		fail(w, http.StatusBadRequest, "некорректный запрос")
+		return
+	}
+	if !s.hub.known(req.PID) {
+		fail(w, http.StatusNotFound, errUnknown.Error())
+		return
+	}
+	id, secret, created := req.UID, req.Secret, false
+	var name string
+	var err error
+	if id == "" {
+		name = cleanName(req.Name)
+		id, secret, err = store.CreateUser(name)
+		created = true
+	} else {
+		name, err = store.Login(id, secret)
+	}
+	if errors.Is(err, errBadLogin) {
+		fail(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "база данных недоступна")
+		return
+	}
+	if err := s.hub.Attach(req.PID, id, name); err != nil {
+		fail(w, http.StatusNotFound, err.Error())
+		return
+	}
+	out := map[string]string{"uid": id, "name": name}
+	if created {
+		out["secret"] = secret
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) profile(w http.ResponseWriter, r *http.Request) {
+	if s.hub.store == nil {
+		fail(w, http.StatusNotFound, "профили отключены")
+		return
+	}
+	p, err := s.hub.store.Profile(r.URL.Query().Get("uid"))
+	switch {
+	case errors.Is(err, errNoUser):
+		fail(w, http.StatusNotFound, err.Error())
+	case err != nil:
+		fail(w, http.StatusInternalServerError, "база данных недоступна")
+	default:
+		writeJSON(w, http.StatusOK, p)
+	}
+}
+
+func (s *Server) top(w http.ResponseWriter, r *http.Request) {
+	if s.hub.store == nil {
+		fail(w, http.StatusNotFound, "профили отключены")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	t, err := s.hub.store.Top(limit)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "база данных недоступна")
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
 }
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +255,10 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		"rounds":     s.cfg.Rounds,
 		"qPerRound":  s.cfg.QPerRound,
 		"questionMs": s.cfg.QuestionTime.Milliseconds(),
+		"points":     correctPoints,
+		"minPoints":  minCorrectPoints,
+		"maxSeats":   maxSeats,
+		"profiles":   s.hub.store != nil,
 		"categories": cats,
 		"questions":  total,
 	})

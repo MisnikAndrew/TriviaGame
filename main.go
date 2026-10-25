@@ -30,14 +30,15 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "файл закрытого ключа к -tls-cert")
 	skipSrc := flag.String("skip-src", "", "не загружать вопросы из этих источников, через запятую (chgk — вопросы ЧГК, их лицензия не разрешает публичный сервер)")
 	maxPlayers := flag.Int("max-players", defaultMaxPlayer, "сколько игроков пускать на сервер одновременно (0 — без ограничения)")
+	dbPath := flag.String("db", "triviagame.db", "файл базы SQLite: профили, рейтинг, статистика (пусто — без профилей и статистики)")
 	maxPerIP := flag.Int("max-per-ip", defaultMaxPerIP, "сколько открытых соединений разрешено с одного адреса (0 — без ограничения)")
 	flag.IntVar(&cfg.Rounds, "rounds", cfg.Rounds, "раундов в матче")
 	flag.IntVar(&cfg.QPerRound, "questions", cfg.QPerRound, "вопросов в раунде")
 	secs := flag.Int("time", int(cfg.QuestionTime/time.Second), "секунд на ответ")
 	flag.Parse()
 	cfg.QuestionTime = time.Duration(*secs) * time.Second
-	if cfg.Rounds < 1 || cfg.QPerRound < 1 || *secs < 3 {
-		log.Fatal("rounds и questions должны быть >= 1, time >= 3")
+	if cfg.Rounds < 1 || cfg.QPerRound < 1 || *secs < minQuestionSecs {
+		log.Fatalf("rounds и questions должны быть >= 1, time >= %d", minQuestionSecs)
 	}
 
 	var bank *Bank
@@ -90,6 +91,13 @@ func main() {
 	defer stop()
 
 	hub := NewHub(cfg, bank)
+	if *dbPath != "" {
+		hub.store, err = OpenStore(*dbPath)
+		if err != nil {
+			log.Fatalf("не удалось открыть базу:\n%v", err)
+		}
+		defer hub.store.Close()
+	}
 	hub.maxClients = *maxPlayers
 	go hub.Janitor(ctx)
 	srv := &Server{hub: hub, cfg: cfg, bank: bank, urls: urls, web: web, publicURL: publicURL, trustProxy: *trustProxy}
@@ -130,6 +138,9 @@ func main() {
 	if *trustProxy && !loopbackAddr(*addr) {
 		fmt.Println("\n  ⚠ -trust-proxy при открытом -addr: любой может подделать свой адрес в заголовках.")
 		fmt.Println("    Если игра доступна только через туннель, запускайте с -addr 127.0.0.1:" + port)
+	}
+	if hub.store != nil {
+		fmt.Printf("\n  Профили и статистика: %s\n", *dbPath)
 	}
 	fmt.Println("\nCtrl+C — остановить сервер")
 

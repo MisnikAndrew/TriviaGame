@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +46,20 @@ type Bank struct {
 type Asked struct {
 	Text    string
 	Options []string
-	Answer  int // index of the correct option in Options
+	Answer  int    // index of the correct option in Options
+	Cat     string // id of the category it belongs to
+	Key     string // identifies the question in the statistics
+}
+
+// questionKey names a question for the statistics; it survives restarts and
+// changes only when the question's text or its options are edited. The options
+// are part of the key because template questions ("Which of these rivers is the
+// longest?") repeat their text with different answers.
+func questionKey(cat string, q *Question) string {
+	opts := append([]string{q.Correct}, q.Wrong...)
+	slices.Sort(opts)
+	sum := sha256.Sum256([]byte(cat + "\x00" + q.Text + "\x00" + strings.Join(opts, "\x1f")))
+	return hex.EncodeToString(sum[:8])
 }
 
 func newAsked(q *Question) Asked {
@@ -76,6 +91,23 @@ func (b *Bank) Without(minPerCategory int, sources ...string) *Bank {
 		}
 	}
 	return &out
+}
+
+// Only returns the categories with the given ids that hold at least
+// minPerCategory questions; it fails on an unknown id.
+func (b *Bank) Only(minPerCategory int, ids []string) (*Bank, error) {
+	var out Bank
+	for _, c := range b.Cats {
+		if slices.Contains(ids, c.ID) && len(c.Questions) >= minPerCategory {
+			out.Cats = append(out.Cats, c)
+		}
+	}
+	for _, id := range ids {
+		if !slices.ContainsFunc(b.Cats, func(c *Category) bool { return c.ID == id }) {
+			return nil, fmt.Errorf("неизвестная тема %q", id)
+		}
+	}
+	return &out, nil
 }
 
 // CountFrom is the number of questions that come from the given source.
@@ -149,13 +181,15 @@ func (c *Category) validate(minQuestions int) error {
 		if strings.TrimSpace(q.Text) == "" {
 			errs = append(errs, fmt.Errorf("%s: пустой текст", where))
 		}
-		if seen[q.Text] {
-			errs = append(errs, fmt.Errorf("%s: дубликат вопроса %q", where, q.Text))
-		}
-		seen[q.Text] = true
 		if len(q.Wrong) != 3 {
 			errs = append(errs, fmt.Errorf("%s: нужно ровно 3 неверных ответа, есть %d", where, len(q.Wrong)))
 			continue
+		}
+		// the same text is fine for template questions as long as the options differ
+		if k := questionKey(c.ID, &c.Questions[i]); seen[k] {
+			errs = append(errs, fmt.Errorf("%s: дубликат вопроса %q", where, q.Text))
+		} else {
+			seen[k] = true
 		}
 		opts := map[string]bool{}
 		for _, o := range append([]string{q.Correct}, q.Wrong...) {

@@ -36,8 +36,10 @@ func TestThirdPartyQuestionsAreAttributed(t *testing.T) {
 	}
 	// источник -> что обязано упоминаться в data/NOTICE.md
 	required := map[string]string{
-		"opentdb": "CC BY-SA 4.0",
-		"chgk":    "только для личного использования",
+		"opentdb":  "CC BY-SA 4.0",
+		"chgk":     "только для личного использования",
+		"wikidata": "CC0",
+		"siq":      "Своя игра",
 	}
 	used := map[string]int{}
 	for _, c := range bank.Cats {
@@ -59,6 +61,25 @@ func TestThirdPartyQuestionsAreAttributed(t *testing.T) {
 		if want, ok := required[src]; ok && !strings.Contains(string(notice), want) {
 			t.Errorf("в базе %d вопросов с источником %q, а в data/NOTICE.md нет фразы %q", n, src, want)
 		}
+	}
+}
+
+// Вопросы-шаблоны («Какая из этих рек самая длинная?») повторяют текст с разными
+// вариантами ответа: это разные вопросы, и статистика ведётся по каждому отдельно.
+func TestSameTextWithOtherOptionsIsAnotherQuestion(t *testing.T) {
+	a := &Question{Text: "Какая из этих рек самая длинная?", Correct: "Волга", Wrong: []string{"Ока", "Кама", "Дон"}}
+	b := &Question{Text: a.Text, Correct: "Нил", Wrong: []string{"Ока", "Кама", "Дон"}}
+	c := &Question{Text: a.Text, Correct: "Волга", Wrong: []string{"Дон", "Кама", "Ока"}} // те же варианты в другом порядке
+	if questionKey("g", a) == questionKey("g", b) {
+		t.Error("разные варианты ответа должны давать разные ключи")
+	}
+	if questionKey("g", a) != questionKey("g", c) {
+		t.Error("порядок неверных вариантов не должен менять ключ")
+	}
+	bank := fstest.MapFS{"d/x.json": {Data: []byte(`{"id":"x","name":"X","icon":"x","questions":[
+		{"q":"?","correct":"a","wrong":["b","c","d"]},{"q":"?","correct":"e","wrong":["b","c","d"]},{"q":"??","correct":"a","wrong":["b","c","d"]}]}`)}}
+	if _, err := LoadBank(bank, "d", 3); err != nil {
+		t.Errorf("один текст с разными ответами должен загружаться: %v", err)
 	}
 }
 

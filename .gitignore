@@ -1,3 +1,8 @@
 # сборка и мусор macOS
 /triviagame
 .DS_Store
+
+# база игроков
+*.db
+*.db-wal
+*.db-shm

@@ -81,7 +81,7 @@ install -d -m 755 "$DIR"
 install -m 755 /tmp/triviagame.new "$DIR/triviagame"
 rm -f /tmp/triviagame.new
 
-args="-addr :$PORT -public-url $URL"
+args="-addr :$PORT -public-url $URL -db /var/lib/triviagame/triviagame.db"
 [ -z "$SKIP_SRC" ] || args="$args -skip-src $SKIP_SRC"
 cat > /etc/systemd/system/triviagame.service <<UNIT
 [Unit]
@@ -91,6 +91,7 @@ Wants=network-online.target
 
 [Service]
 User=triviagame
+StateDirectory=triviagame
 ExecStart=$DIR/triviagame $args
 Restart=always
 RestartSec=2

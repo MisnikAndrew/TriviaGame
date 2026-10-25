@@ -126,11 +126,12 @@ func TestHTTPServesFrontendAndInfo(t *testing.T) {
 			Count int    `json:"count"`
 		} `json:"categories"`
 		Questions int `json:"questions"`
+		Points    int `json:"points"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		t.Fatal(err)
 	}
-	if info.Rounds != 3 || len(info.Categories) < 8 || info.Questions < 100 || len(info.URLs) != 1 {
+	if info.Rounds != 3 || len(info.Categories) < 8 || info.Questions < 100 || len(info.URLs) != 1 || info.Points != correctPoints {
 		t.Errorf("странный /api/info: %+v", info)
 	}
 }
@@ -186,7 +187,7 @@ func TestHTTPFullGameVsBot(t *testing.T) {
 				post(t, ts.URL, "pick", map[string]any{"pid": pid, "index": 1})
 			}
 		case "question":
-			if g.MyAnswer < 0 {
+			if g.me().Answer < 0 {
 				post(t, ts.URL, "answer", map[string]any{"pid": pid, "seq": g.Question.Seq, "index": 0})
 			}
 		case "reveal":
@@ -203,6 +204,165 @@ func TestHTTPFullGameVsBot(t *testing.T) {
 		t.Error("leave")
 	}
 	c.waitFor(t, func(st ClientState) bool { return st.Screen == "menu" })
+}
+
+func TestHTTPPauseEndpoint(t *testing.T) {
+	ts, _ := testServer(t)
+	const pid = "player-http-3"
+	c := openSSE(t, ts.URL, pid, "Вика")
+	c.waitFor(t, func(ClientState) bool { return true })
+
+	if code, _ := post(t, ts.URL, "pause", map[string]any{"pid": pid, "on": true}); code != 409 {
+		t.Errorf("пауза вне игры: статус %d, ожидался 409", code)
+	}
+	post(t, ts.URL, "bot", map[string]any{"pid": pid})
+	c.waitFor(t, func(st ClientState) bool { return st.Game != nil && st.Game.Phase == "pick" })
+
+	if code, _ := post(t, ts.URL, "pause", map[string]any{"pid": pid, "on": true}); code != 200 {
+		t.Fatalf("пауза: статус %d", code)
+	}
+	st := c.waitFor(t, func(st ClientState) bool { return st.Game != nil && st.Game.Paused })
+	if !st.Game.IPaused || st.Game.PausedBy != "Вика" {
+		t.Errorf("пауза должна быть от Вики: %+v", st.Game)
+	}
+	post(t, ts.URL, "pause", map[string]any{"pid": pid, "on": false})
+	c.waitFor(t, func(st ClientState) bool { return st.Game != nil && st.Game.Phase == "pick" && !st.Game.Paused })
+	post(t, ts.URL, "leave", map[string]any{"pid": pid})
+}
+
+func TestHTTPCreateRoomWithRules(t *testing.T) {
+	ts, _ := testServer(t)
+	const pid = "player-http-4"
+	c := openSSE(t, ts.URL, pid, "Лена")
+	c.waitFor(t, func(ClientState) bool { return true })
+
+	if code, _ := post(t, ts.URL, "room", map[string]any{"pid": pid, "seconds": 2}); code != 409 {
+		t.Errorf("слишком короткое время: статус %d, ожидался 409", code)
+	}
+	if code, _ := post(t, ts.URL, "room", map[string]any{"pid": pid, "seconds": 45, "speed": true}); code != 200 {
+		t.Fatalf("создание комнаты: статус %d", code)
+	}
+	st := c.waitFor(t, func(st ClientState) bool { return st.Screen == "room" })
+	if st.Rules == nil || *st.Rules != (RulesView{Seconds: 45, Speed: true, Rounds: 3, QPerRound: 2}) {
+		t.Errorf("правила комнаты: %+v", st.Rules)
+	}
+	post(t, ts.URL, "cancel", map[string]any{"pid": pid})
+	c.waitFor(t, func(st ClientState) bool { return st.Screen == "menu" })
+
+	// запрос без правил — комната по умолчанию: время сервера, скорость не считается
+	post(t, ts.URL, "room", map[string]any{"pid": pid})
+	if st := c.waitFor(t, func(st ClientState) bool { return st.Screen == "room" }); st.Rules == nil || st.Rules.Speed {
+		t.Errorf("правила по умолчанию: %+v", st.Rules)
+	}
+}
+
+func TestHTTPLobbyStartAndHint(t *testing.T) {
+	ts, _ := testServer(t)
+	const a, b = "player-http-5", "player-http-6"
+	ca := openSSE(t, ts.URL, a, "Аня")
+	cb := openSSE(t, ts.URL, b, "Боря")
+	ca.waitFor(t, func(ClientState) bool { return true })
+	cb.waitFor(t, func(ClientState) bool { return true })
+
+	post(t, ts.URL, "room", map[string]any{"pid": a, "bots": 1, "hints": true, "seconds": 5})
+	code := ca.waitFor(t, func(st ClientState) bool { return st.Screen == "room" }).Room
+	if c, _ := post(t, ts.URL, "join", map[string]any{"pid": b, "code": code}); c != 200 {
+		t.Fatalf("вход в комнату: статус %d", c)
+	}
+	st := ca.waitFor(t, func(st ClientState) bool { return st.Lobby != nil && len(st.Lobby.Players) == 3 })
+	if !st.Lobby.Host || !st.Lobby.CanStart || !st.Rules.Hints {
+		t.Errorf("лобби создателя: %+v %+v", st.Lobby, st.Rules)
+	}
+	if c, _ := post(t, ts.URL, "start", map[string]any{"pid": b}); c != 409 {
+		t.Errorf("гость запускает игру: статус %d, ожидался 409", c)
+	}
+	if c, _ := post(t, ts.URL, "hint", map[string]any{"pid": a, "kind": "fifty"}); c != 409 {
+		t.Errorf("подсказка вне игры: статус %d, ожидался 409", c)
+	}
+	if c, _ := post(t, ts.URL, "start", map[string]any{"pid": a}); c != 200 {
+		t.Fatalf("старт: статус %d", c)
+	}
+	for _, c := range []*sseClient{ca, cb} {
+		g := c.waitFor(t, func(st ClientState) bool { return st.Game != nil && st.Game.Phase == "pick" }).Game
+		if len(g.Players) != 3 || !g.Rules.Hints {
+			t.Errorf("игра на троих с подсказками: %+v", g)
+		}
+	}
+	if c, _ := post(t, ts.URL, "hint", map[string]any{"pid": a, "kind": "bogus"}); c != 409 {
+		t.Errorf("неизвестная подсказка: статус %d, ожидался 409", c)
+	}
+	post(t, ts.URL, "leave", map[string]any{"pid": a})
+	post(t, ts.URL, "leave", map[string]any{"pid": b})
+}
+
+func get(t *testing.T, url string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func TestHTTPProfilesAreOffWithoutADatabase(t *testing.T) {
+	ts, _ := testServer(t)
+	c := openSSE(t, ts.URL, "player-http-7", "Тест")
+	c.waitFor(t, func(ClientState) bool { return true })
+	if code, _ := post(t, ts.URL, "login", map[string]any{"pid": "player-http-7"}); code != 404 {
+		t.Errorf("вход без базы: статус %d, ожидался 404", code)
+	}
+	if code, _ := get(t, ts.URL+"/api/top"); code != 404 {
+		t.Errorf("топ без базы: статус %d", code)
+	}
+	if code, body := get(t, ts.URL+"/api/info"); code != 200 || !strings.Contains(body, `"profiles":false`) {
+		t.Errorf("info без базы: %d %s", code, body)
+	}
+}
+
+func TestHTTPLoginProfileAndTop(t *testing.T) {
+	ts, srv := testServer(t)
+	srv.hub.store = testStore(t)
+	const pid = "player-http-8"
+	c := openSSE(t, ts.URL, pid, "Лена")
+	c.waitFor(t, func(ClientState) bool { return true })
+
+	type loginReply struct{ UID, Secret, Name string }
+	login := func(body map[string]any) (int, loginReply) {
+		code, out := post(t, ts.URL, "login", body)
+		var r loginReply
+		json.Unmarshal([]byte(out), &r)
+		return code, r
+	}
+
+	if code, _ := login(map[string]any{"pid": "player-unknown"}); code != 404 {
+		t.Errorf("незнакомое соединение: статус %d, ожидался 404", code)
+	}
+	code, first := login(map[string]any{"pid": pid, "name": "Лена"})
+	if code != 200 || first.UID == "" || first.Secret == "" || first.Name != "Лена" {
+		t.Fatalf("регистрация: %d %+v", code, first)
+	}
+	if code, again := login(map[string]any{"pid": pid, "uid": first.UID, "secret": first.Secret}); code != 200 || again.UID != first.UID || again.Secret != "" {
+		t.Errorf("повторный вход: %d %+v (секрет выдаётся только при регистрации)", code, again)
+	}
+	if code, _ := login(map[string]any{"pid": pid, "uid": first.UID, "secret": "wrong"}); code != 401 {
+		t.Errorf("чужой секрет: статус %d, ожидался 401", code)
+	}
+
+	code, body := get(t, ts.URL+"/api/profile?uid="+first.UID)
+	if code != 200 || !strings.Contains(body, `"name":"Лена"`) || strings.Contains(body, first.Secret) {
+		t.Errorf("профиль: %d %s", code, body)
+	}
+	if code, _ := get(t, ts.URL+"/api/profile?uid=nobody"); code != 404 {
+		t.Errorf("профиль несуществующего игрока: статус %d", code)
+	}
+	if code, body := get(t, ts.URL+"/api/top"); code != 200 || strings.TrimSpace(body) != "[]" {
+		t.Errorf("топ без рейтинговых игр: %d %s", code, body)
+	}
+	if code, body := get(t, ts.URL+"/api/info"); code != 200 || !strings.Contains(body, `"profiles":true`) {
+		t.Errorf("info с базой: %d %s", code, body)
+	}
 }
 
 func TestHTTPSecondTabReplacesFirst(t *testing.T) {
